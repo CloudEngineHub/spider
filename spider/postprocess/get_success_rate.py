@@ -10,13 +10,18 @@ Author: Chaoyi Pan
 Date: 2025-07-31
 """
 
+import json
 import os
 
 import numpy as np
 import pandas as pd
 import tyro
 
+from spider import ROOT
 from spider.io import get_all_tasks, get_processed_data_dir
+
+DEFAULT_REF_DT = 0.02
+DEFAULT_SIM_DT = 0.01
 
 
 def quat_to_vel(quat: np.ndarray) -> np.ndarray:
@@ -99,11 +104,61 @@ def quat_sub(qa, qb):
     return quat_to_vel(qdif)
 
 
+def _load_task_dts(task_processed_dir: str, task_name: str) -> tuple[float, float]:
+    task_info_path = os.path.join(task_processed_dir, "task_info.json")
+    ref_dt = DEFAULT_REF_DT
+    sim_dt = DEFAULT_SIM_DT
+    if not os.path.exists(task_info_path):
+        print(
+            f"Warning: task_info.json not found for {task_name} at {task_info_path}; "
+            f"using defaults ref_dt={DEFAULT_REF_DT}, sim_dt={DEFAULT_SIM_DT}"
+        )
+        return ref_dt, sim_dt
+
+    try:
+        with open(task_info_path) as f:
+            task_info = json.load(f)
+    except Exception as e:
+        print(
+            f"Warning: failed to read {task_info_path} ({e}); "
+            f"using defaults ref_dt={DEFAULT_REF_DT}, sim_dt={DEFAULT_SIM_DT}"
+        )
+        return ref_dt, sim_dt
+
+    if "ref_dt" not in task_info:
+        print(
+            f"Warning: ref_dt missing in {task_info_path}; "
+            f"using default ref_dt={DEFAULT_REF_DT}"
+        )
+    else:
+        ref_dt = float(task_info["ref_dt"])
+
+    if "sim_dt" not in task_info:
+        print(
+            f"Warning: sim_dt missing in {task_info_path}; "
+            f"using default sim_dt={DEFAULT_SIM_DT}"
+        )
+    else:
+        sim_dt = float(task_info["sim_dt"])
+
+    return ref_dt, sim_dt
+
+
+def _get_downsample_factor(ref_dt: float, sim_dt: float) -> int:
+    ratio = ref_dt / sim_dt
+    factor = int(round(ratio))
+    if factor < 1 or not np.isclose(ratio, factor, rtol=1e-6, atol=1e-9):
+        raise ValueError(
+            f"ref_dt/sim_dt must be a positive integer, got ref_dt={ref_dt}, sim_dt={sim_dt}"
+        )
+    return factor
+
+
 def main(
-    dataset_dir: str = "../../example_datasets",
+    dataset_dir: str = f"{ROOT}/../example_datasets",
     dataset_name: str = "oakink",
     robot_type: str = "allegro",
-    hand_type: str = "bimanual",
+    embodiment_type: str = "bimanual",
     data_type: str = "ikrollout",
     pos_err_threshold: float = 0.1,
     quat_err_threshold: float = 0.5,
@@ -115,7 +170,7 @@ def main(
         dataset_dir=dataset_dir,
         dataset_name=dataset_name,
         robot_type=robot_type,
-        hand_type=hand_type,
+        embodiment_type=embodiment_type,
     )
 
     print(f"Found tasks: {all_tasks}")
@@ -126,10 +181,11 @@ def main(
     # Iterate through each task directory and find data_id subdirectories
     for task_name in all_tasks:
         # Get the task directory structure from processed data
-        task_processed_dir = f"{dataset_dir}/processed/{dataset_name}/{robot_type}/{hand_type}/{task_name}"
+        task_processed_dir = f"{dataset_dir}/processed/{dataset_name}/{robot_type}/{embodiment_type}/{task_name}"
         if not os.path.isdir(task_processed_dir):
             print(f"Warning: task directory not found: {task_processed_dir}")
             continue
+        ref_dt, sim_dt = _load_task_dts(task_processed_dir, task_name)
 
         # Get all data_id directories within the task
         data_id_dirs = [
@@ -146,7 +202,7 @@ def main(
                 dataset_dir=dataset_dir,
                 dataset_name=dataset_name,
                 robot_type=robot_type,
-                hand_type=hand_type,
+                embodiment_type=embodiment_type,
                 task=task_name,
                 data_id=data_id,
             )
@@ -179,6 +235,12 @@ def main(
                 kinematic_data = np.load(kinematic_file)
                 qpos_kinematic = kinematic_data["qpos"]
 
+                # Downsample sim trajectory to match reference dt
+                downsample_factor = _get_downsample_factor(ref_dt, sim_dt)
+                downsample_factor = 1
+                if downsample_factor > 1:
+                    qpos_traj = qpos_traj[::downsample_factor]
+
                 # Ensure both trajectories have the same length
                 min_length = min(len(qpos_traj), len(qpos_kinematic))
                 qpos_traj = qpos_traj[:min_length]
@@ -191,7 +253,7 @@ def main(
                 continue
 
             # compute object tracking error
-            if hand_type == "bimanual":
+            if embodiment_type == "bimanual":
                 # get object qpos for both trajectories
                 qpos_object_right_traj = qpos_traj[:, -14:-7]
                 qpos_object_left_traj = qpos_traj[:, -7:]
@@ -229,6 +291,36 @@ def main(
                     axis=1,
                 ).mean()
 
+                if task_name == "lift_board":
+                    from matplotlib import pyplot as plt
+
+                    # plot x, y, z in 3 subplots
+                    # plot quat in 3 subplots
+                    fig, axs = plt.subplots(7, 1)
+                    fig.suptitle(f"Task: {task_name}, Data ID: {data_id}")
+                    axs[0].set_title("x")
+                    axs[1].set_title("y")
+                    axs[2].set_title("z")
+                    axs[3].set_title("quat x")
+                    axs[4].set_title("quat y")
+                    axs[5].set_title("quat z")
+                    axs[6].set_title("quat w")
+                    axs[0].plot(pos_object_right_traj[:, 0])
+                    axs[0].plot(pos_object_right_kinematic[:, 0], "--")
+                    axs[1].plot(pos_object_right_traj[:, 1])
+                    axs[1].plot(pos_object_right_kinematic[:, 1], "--")
+                    axs[2].plot(pos_object_right_traj[:, 2])
+                    axs[2].plot(pos_object_right_kinematic[:, 2], "--")
+                    axs[3].plot(quat_wxyz_object_right_traj[:, 0])
+                    axs[3].plot(quat_wxyz_object_right_kinematic[:, 0], "--")
+                    axs[4].plot(quat_wxyz_object_right_traj[:, 1])
+                    axs[4].plot(quat_wxyz_object_right_kinematic[:, 1], "--")
+                    axs[5].plot(quat_wxyz_object_right_traj[:, 2])
+                    axs[5].plot(quat_wxyz_object_right_kinematic[:, 2], "--")
+                    axs[6].plot(quat_wxyz_object_right_traj[:, 3])
+                    axs[6].plot(quat_wxyz_object_right_kinematic[:, 3], "--")
+                    plt.show()
+
                 # compute average pos and quat error (handle the case where the object is a place holder)
                 # if pos_object_right_kinematic close to 0, then only use left
                 # if pos_object_left_kinematic close to 0, then only use right
@@ -247,7 +339,6 @@ def main(
                     ).mean()
                     < 0.001
                 )
-
                 if left_mask:
                     obj_pos_err = pos_err_right
                     obj_quat_err = quat_err_right
@@ -277,10 +368,10 @@ def main(
                     quat_sub(quat_wxyz_object_traj, quat_wxyz_object_kinematic), axis=1
                 ).mean()
 
-                pos_err_right = obj_pos_err if hand_type == "right" else 0.0
-                pos_err_left = obj_pos_err if hand_type == "left" else 0.0
-                quat_err_right = obj_quat_err if hand_type == "right" else 0.0
-                quat_err_left = obj_quat_err if hand_type == "left" else 0.0
+                pos_err_right = obj_pos_err if embodiment_type == "right" else 0.0
+                pos_err_left = obj_pos_err if embodiment_type == "left" else 0.0
+                quat_err_right = obj_quat_err if embodiment_type == "right" else 0.0
+                quat_err_left = obj_quat_err if embodiment_type == "left" else 0.0
 
             # compute success
             success = (obj_pos_err < pos_err_threshold) & (
@@ -291,7 +382,7 @@ def main(
             df_entry = {
                 "dataset": dataset_name,
                 "robot_type": robot_type,
-                "hand_type": hand_type,
+                "embodiment_type": embodiment_type,
                 "data_type": data_type,
                 "task": task_name,
                 "data_id": data_id,
@@ -327,7 +418,7 @@ def main(
         dataset_dir=dataset_dir,
         dataset_name=dataset_name,
         robot_type=robot_type,
-        hand_type=hand_type,
+        embodiment_type=embodiment_type,
         task=task_name,
         data_id=0,
     )
@@ -343,7 +434,7 @@ def main(
         [
             "dataset",
             "robot_type",
-            "hand_type",
+            "embodiment_type",
             "data_type",
             "task",
             "data_id",
@@ -406,7 +497,7 @@ def main(
             mask = (
                 (existing_summary["dataset"] == dataset_name)
                 & (existing_summary["robot_type"] == robot_type)
-                & (existing_summary["hand_type"] == hand_type)
+                & (existing_summary["embodiment_type"] == embodiment_type)
                 & (existing_summary["pos_err_threshold"] == pos_err_threshold)
                 & (existing_summary["quat_err_threshold"] == quat_err_threshold)
             )

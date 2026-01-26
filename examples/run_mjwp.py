@@ -37,8 +37,8 @@ from spider.simulators.mjwp import (
     get_qpos,
     get_qvel,
     get_reward,
-    get_terminate,
     get_terminal_reward,
+    get_terminate,
     get_trace,
     load_env_params,
     load_state,
@@ -224,7 +224,7 @@ def main(config: Config):
             # rule out "trace"
             info_list.append({k: v for k, v in infos.items() if k != "trace_sample"})
 
-            if sim_step >= config.max_sim_steps:
+            if sim_step >= config.max_sim_steps - 1:
                 break
 
         t_end = time.perf_counter()
